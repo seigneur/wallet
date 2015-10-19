@@ -17,6 +17,8 @@
 package com.mycelium.wapi.wallet;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import com.mrd.bitlib.PopBuilder;
 import com.mrd.bitlib.StandardTransactionBuilder;
 import com.mrd.bitlib.StandardTransactionBuilder.InsufficientFundsException;
 import com.mrd.bitlib.StandardTransactionBuilder.OutputTooSmallException;
@@ -48,7 +50,6 @@ import com.mycelium.wapi.wallet.currency.CurrencyValue;
 import com.mycelium.wapi.wallet.currency.ExactBitcoinValue;
 import com.mycelium.wapi.wallet.currency.ExactCurrencyValue;
 
-import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
@@ -192,19 +193,31 @@ public abstract class AbstractAccount implements WalletAccount {
       // Make a map for fast lookup
       Map<OutPoint, TransactionOutputEx> localMap = toMap(localUnspent);
 
+      Set<Sha256Hash> transactionsToAddOrUpdate = new HashSet<Sha256Hash>();
+      Set<Address> addressesToDiscover = new HashSet<Address>();
+
       // Find remotely removed unspent outputs
       for (TransactionOutputEx l : localUnspent) {
          TransactionOutputEx r = remoteMap.get(l.outPoint);
          if (r == null) {
             // An output has gone. Maybe it was spent in another wallet, or
             // never confirmed due to missing fees, double spend, or mutated.
-            // Either way, we delete it locally
+
+            // we need to fetch associated transactions, to see the outgoing tx in the history
+            ScriptOutput scriptOutput = ScriptOutput.fromScriptBytes(l.script);
+            if (scriptOutput != null){
+            Address address = scriptOutput.getAddress(_network);
+               if (!address.equals(Address.getNullAddress(_network))){
+                  addressesToDiscover.add(address);
+               }
+            }
+
+            // Either way, we delete the UTXO locally
             _backing.deleteUnspentOutput(l.outPoint);
          }
       }
 
       // Find remotely added unspent outputs
-      Set<Sha256Hash> transactionsToAddOrUpdate = new HashSet<Sha256Hash>();
       List<TransactionOutputEx> unspentOutputsToAddOrUpdate = new LinkedList<TransactionOutputEx>();
       for (TransactionOutputEx r : remoteUnspent) {
          TransactionOutputEx l = localMap.get(r.outPoint);
@@ -241,6 +254,16 @@ public abstract class AbstractAccount implements WalletAccount {
          // outputs
          for (TransactionOutputEx output : unspentOutputsToAddOrUpdate) {
             _backing.putUnspentOutput(output);
+         }
+      }
+
+      // if we removed some UTXO because of an sync, it means that there are transactions
+      // we dont yet know about. Run a discover for all addresses related to the UTXOs we removed
+      if (addressesToDiscover.size() > 0){
+         try {
+            doDiscoveryForAddresses(Lists.newArrayList(addressesToDiscover));
+         } catch (WapiException ign) {
+            // ignore?
          }
       }
 
@@ -772,6 +795,8 @@ public abstract class AbstractAccount implements WalletAccount {
       return list;
    }
 
+   protected abstract boolean doDiscoveryForAddresses(List<Address> lookAhead) throws WapiException;
+
    protected abstract Address getChangeAddress();
 
    protected static Collection<UnspentTransactionOutput> transform(Collection<TransactionOutputEx> source) {
@@ -878,9 +903,23 @@ public abstract class AbstractAccount implements WalletAccount {
    @Override
    public CurrencyBasedBalance getCurrencyBasedBalance() {
       Balance balance = getBalance();
-      ExactCurrencyValue confirmed = ExactBitcoinValue.from(balance.getSpendableBalance());
-      ExactCurrencyValue sending = ExactBitcoinValue.from(balance.getSendingBalance());
-      ExactCurrencyValue receiving = ExactBitcoinValue.from(balance.getReceivingBalance());
+      long spendableBalance = balance.getSpendableBalance();
+      long sendingBalance = balance.getSendingBalance();
+      long receivingBalance = balance.getReceivingBalance();
+
+      if (spendableBalance < 0){
+         throw new IllegalArgumentException(String.format("spendableBalance < 0: %d; account: %s", spendableBalance, this.getClass().toString()));
+      }
+      if (sendingBalance < 0){
+         throw new IllegalArgumentException(String.format("sendingBalance < 0: %d; account: %s", sendingBalance, this.getClass().toString()));
+      }
+      if (receivingBalance < 0){
+         throw new IllegalArgumentException(String.format("receivingBalance < 0: %d; account: %s", receivingBalance, this.getClass().toString()));
+      }
+
+      ExactCurrencyValue confirmed = ExactBitcoinValue.from(spendableBalance);
+      ExactCurrencyValue sending = ExactBitcoinValue.from(sendingBalance);
+      ExactCurrencyValue receiving = ExactBitcoinValue.from(receivingBalance);
       return new CurrencyBasedBalance(confirmed,sending, receiving);
    }
 
@@ -1173,14 +1212,14 @@ public abstract class AbstractAccount implements WalletAccount {
 
          TransactionOutput popOutput = createPopOutput(txid, nonce);
 
-         StandardTransactionBuilder stb = new StandardTransactionBuilder(_network);
+         PopBuilder popBuilder = new PopBuilder(_network);
 
-         UnsignedTransaction unsignedTransaction = stb.createUnsignedPop(Collections.singletonList(popOutput), funding,
+         UnsignedTransaction unsignedTransaction = popBuilder.createUnsignedPop(Collections.singletonList(popOutput), funding,
                  new PublicKeyRing(), _network);
 
          return unsignedTransaction;
       } catch (TransactionParsingException e) {
-         throw new RuntimeException("Cannot parse transaction", e);
+         throw new RuntimeException("Cannot parse transaction: " + e.getMessage(), e);
       }
    }
 
@@ -1189,7 +1228,7 @@ public abstract class AbstractAccount implements WalletAccount {
       ByteBuffer byteBuffer = ByteBuffer.allocate(41);
       byteBuffer.put((byte) Script.OP_RETURN);
 
-      byteBuffer.put((byte)1).put((byte)0); // version 1
+      byteBuffer.put((byte)1).put((byte)0); // version 1, little endian
 
       byteBuffer.put(txidToProve.getBytes()); // txid
 
